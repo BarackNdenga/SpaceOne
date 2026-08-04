@@ -1,0 +1,29 @@
+[Unit]
+Description=SpaceOne Coordination — MAP + Autonomous Scheduler
+Documentation=https://docs.spaceone.space
+After=spaceone-core.service aqm-supervisor.service aqm-dtnd.service
+Requires=spaceone-core.service
+PartOf=spaceone-core.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/spaceone-coordination --supervisor-socket /run/aqm/aqm-supervisor.sock --config /etc/spaceone/platform_config.toml
+Restart=always
+RestartSec=5
+RuntimeDirectory=spaceone
+User=operator
+
+# Coordination needs supervisor access
+ProtectSystem=true
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+ReadWritePaths=/run/spaceone /var/lib/spaceone
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=spaceone-coordination
+
+[Install]
+WantedBy=multi-user.target
