@@ -1,0 +1,81 @@
+# SpaceOne Mission Control Configuration
+# Centre de contrôle mission — supervision Terre des opérations Mars
+
+[server]
+host = "0.0.0.0"
+port = 3420
+websocket_port = 3421
+log_level = "info"
+max_connections = 100
+
+[dtn]
+endpoint = "dtn://mission-control/"
+retry_interval_seconds = 60
+max_retry_count = 3
+bundle_max_size_kb = 64
+communication_window_hours = 8  # Fenêtre de communication quotidienne
+deep_space_network = "DSN Goldstone"
+
+[security]
+rbac_enabled = true
+require_mfa = true
+session_timeout_minutes = 480
+audit_log_path = "/var/log/spaceone/audit.log"
+encryption_at_rest = true
+allowed_roles = ["MissionCommander", "FlightDirector", "Scientist", "Engineer", "Operator"]
+
+[assets]
+# Rover Perseverance-X
+[assets.rover-01]
+name = "Perseverance-X"
+type = "rover"
+position_lat = -14.5684
+position_lon = 175.4785
+max_speed_kmh = 0.04
+solar_panel_area_m2 = 2.5
+battery_capacity_wh = 5000
+science_instruments = ["MastCamera", "SuperCam", "PiXL", "SHERLOC", "MOXIE", "MEDA"]
+
+# Habitat Ares Base Alpha
+[assets.habitat-01]
+name = "Ares Base Alpha"
+type = "habitat"
+position_lat = -14.5680
+position_lon = 175.4790
+crew_capacity = 6
+life_support_hours = 720
+solar_panel_area_m2 = 50.0
+science_instruments = ["WeatherStation", "Seismometer", "Magnetometer"]
+
+# Orbiteur Hermes Relay
+[assets.orbiter-01]
+name = "Hermes Relay"
+type = "orbiter"
+orbit_altitude_km = 400
+orbital_period_minutes = 118
+science_instruments = ["AtmosphericPressure", "RadiationDose"]
+
+[alerts]
+critical_threshold_score = 0.3
+warning_threshold_score = 0.6
+auto_safe_mode = true
+notification_email = "mission-control@spaceone.space"
+slack_webhook = ""
+
+[science]
+data_retention_days = 3650  # 10 ans
+auto_classification = true
+quality_threshold = 50.0
+max_storage_tb = 100
+
+[commands]
+require_dual_authorization = true
+max_queue_size = 1000
+auto_cancel_on_timeout = true
+timeout_hours = 72
+
+[dashboard]
+refresh_interval_ms = 5000
+history_retention_hours = 168  # 7 jours
+charts_enabled = true
+map_enabled = true
