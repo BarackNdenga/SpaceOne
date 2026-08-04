@@ -1,269 +1,391 @@
-//! # Autonomous Scheduler
+//! # Multi-Agency Protocol (MAP)
 //!
-//! Planificateur autonome embarqué pour la coordination des tâches martiennes.
-//! Utilise un modèle ONNX (radiation-tolerant via TMR) pour la priorisation
-//! et intègre un planificateur de contingence pour les situations d'urgence.
+//! Core library pour la coordination inter-agences sur Mars.
+//! Implémente les types de messages, l'authentification et la négociation
+//! de ressources entre entités de différentes agences spatiales.
 //!
 //! ## Architecture
 //!
-//! Le scheduler fonctionne en 3 phases :
-//! 1. **Priorisation** — Classe les tâches par urgence et impact scientifique
-//! 2. **Résolution de conflits** — Détecte et résout les chevauchements
-//! 3. **Plan de contingence** — Génère des plans alternatifs en cas d'anomalie
+//! MAP fonctionne comme un protocole de couche applicative au-dessus de DTN++.
+//! Chaque entité (rover, habitat, orbiteur) possède un identifiant unique
+//! et un ensemble de capacités qu'elle peut offrir ou consommer.
+//!
+//! ## Exemple d'utilisation
+//!
+//! ```rust,no_run
+//! use multi_agency_protocol::{MapNode, MapConfig, AgencyId};
+//!
+//! let config = MapConfig {
+//!     node_id: "rover-nasa-01".into(),
+//!     agency: AgencyId::Nasa,
+//!     capabilities: vec!["mobility".into(), "sampling".into()],
+//!     priority: 10,
+//! };
+//!
+//! let node = MapNode::new(config);
+//! ```
 
-pub mod task_prioritizer;
-pub mod conflict_resolver;
-pub mod contingency_planner;
+pub mod message_types;
+pub mod auth;
+pub mod negotiation;
 
 use serde::{Deserialize, Serialize};
-use std::collections::{BinaryHeap, HashMap};
-use std::cmp::Ordering;
-use chrono::{DateTime, Utc};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 use thiserror::Error;
 use tracing::{info, warn, error};
 
-// ─── Types de Tâches ───
+// ─── Identifiants et Types de Base ───
 
-/// Catégorie scientifique d'une tâche
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TaskCategory {
-    Science,        // Observation, échantillonnage, analyse
-    Navigation,     // Déplacement, cartographie
-    Maintenance,    // Calibration, nettoyage, diagnostic
-    Communication,  // Transmission, relay, uplink
-    LifeSupport,    // Énergie, air, eau, thermique
-    Emergency,      // Safe mode, escape, shutdown
-}
-
-/// Statut d'une tâche
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TaskStatus {
-    Queued,
-    Scheduled,
-    InProgress,
-    Completed,
-    Failed,
-    Cancelled,
-    Contingency, // Répliquée par le plan de contingence
-}
-
-/// Identifiant unique d'une tâche
+/// Identifiant unique d'une agence spatiale
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct TaskId(pub String);
+pub enum AgencyId {
+    Nasa,
+    Spacex,
+    Esa,
+    Cnsa,
+    Roscosmos,
+    Isro,
+    Other(String),
+}
 
-impl std::fmt::Display for TaskId {
+impl std::fmt::Display for AgencyId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AgencyId::Nasa => write!(f, "NASA"),
+            AgencyId::Spacex => write!(f, "SPACEX"),
+            AgencyId::Esa => write!(f, "ESA"),
+            AgencyId::Cnsa => write!(f, "CNSA"),
+            AgencyId::Roscosmos => write!(f, "ROSCOSMOS"),
+            AgencyId::Isro => write!(f, "ISRO"),
+            AgencyId::Other(s) => write!(f, "{}", s),
+        }
+    }
+}
+
+/// Identifiant unique d'un noeud sur Mars
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct NodeId(pub String);
+
+impl std::fmt::Display for NodeId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
     }
 }
 
-/// Une tâche planifiable sur Mars
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MarsTask {
-    pub id: TaskId,
-    pub name: String,
-    pub category: TaskCategory,
-    pub priority: u16,       // 0-100, calculé par l'IA
-    pub deadline: Option<DateTime<Utc>>,
-    pub estimated_duration_secs: u32,
-    pub dependencies: Vec<TaskId>,
-    pub required_resources: Vec<ResourceRequirement>,
-    pub executing_node: Option<String>,
-    pub status: TaskStatus,
-    pub created_at: DateTime<Utc>,
-    pub scientific_value: f64, // Score scientifique 0.0-1.0
+/// Type de plateforme martienne
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PlatformType {
+    WheeledRover,
+    LeggedRover,
+    AerialDrone,
+    Habitat,
+    Orbiter,
+    Relay,
 }
 
-/// Exigence de ressource pour une tâche
+/// Statut d'un noeud MAP
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NodeStatus {
+    Active,
+    Standby,
+    Degraded,
+    SafeMode,
+    Offline,
+}
+
+// ─── Configuration ───
+
+/// Configuration d'un noeud MAP
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResourceRequirement {
-    pub resource_type: String,
-    pub amount: f64,
-    pub unit: String,
-    pub critical: bool, // Si false, la tâche peut être réduite
+pub struct MapConfig {
+    pub node_id: String,
+    pub agency: AgencyId,
+    pub capabilities: Vec<String>,
+    pub priority: u8,
+    pub platform: PlatformType,
 }
 
 // ─── Erreurs ───
 
 #[derive(Error, Debug)]
-pub enum SchedulerError {
-    #[error("Tâche introuvable: {0}")]
-    TaskNotFound(TaskId),
+pub enum MapError {
+    #[error("Noeud non trouvé: {0}")]
+    NodeNotFound(NodeId),
 
-    #[error("Cycle de dépendances détecté dans: {0}")]
-    DependencyCycle(String),
+    #[error("Conflit de ressources: {0}")]
+    ResourceConflict(String),
 
-    #[error("Ressources insuffisantes pour: {0}")]
-    InsufficientResources(String),
+    #[error("Authentification échouée: {0}")]
+    AuthFailed(String),
 
-    #[error("Deadline dépassée: {0}")]
-    DeadlineExceeded(TaskId),
+    #[error("Timeout de négociation: {0}ms")]
+    NegotiationTimeout(u64),
 
-    #[error("Conflit non résolu: {0}")]
-    UnresolvedConflict(String),
+    #[error("Capacité non supportée: {0}")]
+    UnsupportedCapability(String),
+
+    #[error("Priorité insuffisante: required={required}, provided={provided}")]
+    InsufficientPriority { required: u8, provided: u8 },
+
+    #[error("Erreur de sérialisation: {0}")]
+    Serialization(String),
 }
 
-pub type SchedulerResult<T> = Result<T, SchedulerError>;
+pub type MapResult<T> = Result<T, MapError>;
 
-// ─── Scheduler Principal ───
+// ─── État du Noeud ───
 
-/// Scheduler autonome embarqué
-pub struct AutonomousScheduler {
-    tasks: HashMap<TaskId, MarsTask>,
-    schedule: Vec<TaskId>,
-    prioritizer: task_prioritizer::TaskPrioritizer,
-    resolver: conflict_resolver::ConflictResolver,
-    contingency: contingency_planner::ContingencyPlanner,
+/// État interne d'un noeud MAP
+#[derive(Debug, Clone)]
+pub struct NodeState {
+    pub id: NodeId,
+    pub agency: AgencyId,
+    pub platform: PlatformType,
+    pub status: NodeStatus,
+    pub capabilities: Vec<String>,
+    pub priority: u8,
+    pub active_negotiations: usize,
+    pub last_heartbeat: chrono::DateTime<chrono::Utc>,
 }
 
-impl AutonomousScheduler {
-    /// Crée un nouveau scheduler autonome
-    pub fn new() -> Self {
+// ─── Noeud MAP Principal ───
+
+/// Le noeud MAP principal qui gère la coordination locale
+pub struct MapNode {
+    pub state: Arc<RwLock<NodeState>>,
+    pub config: MapConfig,
+    pub peers: Arc<RwLock<HashMap<NodeId, PeerInfo>>>,
+    pub message_log: Arc<RwLock<Vec<message_types::MapMessage>>>,
+}
+
+/// Informations sur un pair MAP
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerInfo {
+    pub id: NodeId,
+    pub agency: AgencyId,
+    pub platform: PlatformType,
+    pub capabilities: Vec<String>,
+    pub status: NodeStatus,
+    pub last_seen: chrono::DateTime<chrono::Utc>,
+    pub priority: u8,
+}
+
+impl MapNode {
+    /// Crée un nouveau noeud MAP avec la configuration donnée
+    pub fn new(config: MapConfig) -> Self {
+        info!(
+            "Initializing MAP node: {} ({})",
+            config.node_id, config.agency
+        );
+
+        let state = NodeState {
+            id: NodeId(config.node_id.clone()),
+            agency: config.agency.clone(),
+            platform: config.platform.clone(),
+            status: NodeStatus::Active,
+            capabilities: config.capabilities.clone(),
+            priority: config.priority,
+            active_negotiations: 0,
+            last_heartbeat: chrono::Utc::now(),
+        };
+
         Self {
-            tasks: HashMap::new(),
-            schedule: Vec::new(),
-            prioritizer: task_prioritizer::TaskPrioritizer::new(),
-            resolver: conflict_resolver::ConflictResolver::new(),
-            contingency: contingency_planner::ContingencyPlanner::new(),
+            state: Arc::new(RwLock::new(state)),
+            config,
+            peers: Arc::new(RwLock::new(HashMap::new())),
+            message_log: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
-    /// Ajoute une nouvelle tâche au scheduler
-    pub fn add_task(&mut self, task: MarsTask) -> SchedulerResult<&TaskId> {
-        let id = task.id.clone();
-        self.tasks.insert(id.clone(), task);
-        info!("Task added: {} (category={:?}, priority={})", 
-              id, self.tasks[&id].category, self.tasks[&id].priority);
-        Ok(&id)
+    /// Enregistre un pair découvert sur le réseau
+    pub async fn register_peer(&self, peer: PeerInfo) -> MapResult<()> {
+        let mut peers = self.peers.write().await;
+        info!(
+            "Registering peer: {} (agency={}, platform={:?})",
+            peer.id, peer.agency, peer.platform
+        );
+        peers.insert(peer.id.clone(), peer);
+        Ok(())
     }
 
-    /// Supprime une tâche du scheduler
-    pub fn remove_task(&mut self, task_id: &TaskId) -> SchedulerResult<MarsTask> {
-        self.tasks.remove(task_id)
-            .ok_or(SchedulerError::TaskNotFound(task_id.clone()))
+    /// Supprime un pair de la liste
+    pub async fn remove_peer(&self, node_id: &NodeId) -> MapResult<()> {
+        let mut peers = self.peers.write().await;
+        peers
+            .remove(node_id)
+            .ok_or_else(|| MapError::NodeNotFound(node_id.clone()))?;
+        info!("Removed peer: {}", node_id);
+        Ok(())
     }
 
-    /// Exécute la priorisation complète de toutes les tâches
-    pub fn prioritize_all(&mut self) -> Vec<TaskId> {
-        let tasks: Vec<&MarsTask> = self.tasks.values().collect();
-        let prioritized = self.prioritizer.prioritize(&tasks);
-
-        self.schedule = prioritized.iter().map(|t| t.id.clone()).collect();
-        info!("Prioritized {} tasks", self.schedule.len());
-        self.schedule.clone()
-    }
-
-    /// Résout les conflits dans le planning
-    pub fn resolve_conflicts(&mut self) -> Vec<conflict_resolver::ConflictResolution> {
-        let tasks: Vec<&MarsTask> = self.tasks.values()
-            .filter(|t| t.status == TaskStatus::Scheduled || t.status == TaskStatus::InProgress)
-            .collect();
-
-        self.resolver.resolve(&tasks)
-    }
-
-    /// Génère un plan de contingence pour une tâche défaillante
-    pub fn generate_contingency(&self, failed_task: &TaskId) -> Option<contingency_planner::ContingencyPlan> {
-        let task = self.tasks.get(failed_task)?;
-        self.contingency.plan(task, &self.tasks)
-    }
-
-    /// Produit le planning ordonné complet
-    pub fn full_schedule(&self) -> Vec<&MarsTask> {
-        self.schedule
-            .iter()
-            .filter_map(|id| self.tasks.get(id))
+    /// Récupère la liste des pairs actifs
+    pub async fn active_peers(&self) -> Vec<PeerInfo> {
+        let peers = self.peers.read().await;
+        peers
+            .values()
+            .filter(|p| p.status == NodeStatus::Active)
+            .cloned()
             .collect()
     }
 
-    /// Statistiques du scheduler
-    pub fn statistics(&self) -> SchedulerStats {
-        let by_status: HashMap<TaskStatus, usize> = self.tasks.values()
-            .fold(HashMap::new(), |mut acc, t| {
-                *acc.entry(t.status.clone()).or_insert(0) += 1;
-                acc
-            });
+    /// Trouve les pairs offrant une capacité spécifique
+    pub async fn find_by_capability(&self, capability: &str) -> Vec<PeerInfo> {
+        let peers = self.peers.read().await;
+        peers
+            .values()
+            .filter(|p| p.capabilities.contains(&capability.to_string()))
+            .cloned()
+            .collect()
+    }
 
-        SchedulerStats {
-            total_tasks: self.tasks.len(),
-            completed: by_status.get(&TaskStatus::Completed).copied().unwrap_or(0),
-            in_progress: by_status.get(&TaskStatus::InProgress).copied().unwrap_or(0),
-            failed: by_status.get(&TaskStatus::Failed).copied().unwrap_or(0),
-            queued: by_status.get(&TaskStatus::Queued).copied().unwrap_or(0),
-            average_priority: if self.tasks.is_empty() {
-                0.0
-            } else {
-                self.tasks.values().map(|t| t.priority as f64).sum::<f64>() / self.tasks.len() as f64
-            },
+    /// Met à jour le statut du noeud
+    pub async fn set_status(&self, status: NodeStatus) {
+        let mut state = self.state.write().await;
+        warn!("Node {} status changed to {:?}", state.id, status);
+        state.status = status;
+    }
+
+    /// Met à jour le heartbeat
+    pub async fn heartbeat(&self) {
+        let mut state = self.state.write().await;
+        state.last_heartbeat = chrono::Utc::now();
+    }
+
+    /// Vérifie l'état de santé du noeud
+    pub async fn health_check(&self) -> NodeState {
+        self.state.read().await.clone()
+    }
+
+    /// Comptabilise une négociation active
+    pub async fn increment_negotiations(&self) {
+        let mut state = self.state.write().await;
+        state.active_negotiations += 1;
+    }
+
+    /// Décrémente une négociation terminée
+    pub async fn decrement_negotiations(&self) {
+        let mut state = self.state.write().await;
+        state.active_negotiations = state.active_negotiations.saturating_sub(1);
+    }
+
+    /// Génère un résumé de l'état du réseau
+    pub async fn network_summary(&self) -> NetworkSummary {
+        let state = self.state.read().await;
+        let peers = self.peers.read().await;
+
+        NetworkSummary {
+            local_node: state.id.clone(),
+            local_agency: state.agency.clone(),
+            local_status: state.status.clone(),
+            total_peers: peers.len(),
+            active_peers: peers.values().filter(|p| p.status == NodeStatus::Active).count(),
+            agencies_present: peers.values().map(|p| p.agency.clone()).collect::<std::collections::HashSet<_>>(),
+            active_negotiations: state.active_negotiations,
         }
     }
 }
 
-/// Statistiques du scheduler
+/// Résumé de l'état du réseau MAP
 #[derive(Debug, Clone)]
-pub struct SchedulerStats {
-    pub total_tasks: usize,
-    pub completed: usize,
-    pub in_progress: usize,
-    pub failed: usize,
-    pub queued: usize,
-    pub average_priority: f64,
+pub struct NetworkSummary {
+    pub local_node: NodeId,
+    pub local_agency: AgencyId,
+    pub local_status: NodeStatus,
+    pub total_peers: usize,
+    pub active_peers: usize,
+    pub agencies_present: std::collections::HashSet<AgencyId>,
+    pub active_negotiations: usize,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn sample_task(id: &str, category: TaskCategory, priority: u16) -> MarsTask {
-        MarsTask {
-            id: TaskId(id.into()),
-            name: format!("Task {}", id),
-            category,
-            priority,
-            deadline: None,
-            estimated_duration_secs: 300,
-            dependencies: vec![],
-            required_resources: vec![],
-            executing_node: None,
-            status: TaskStatus::Queued,
-            created_at: Utc::now(),
-            scientific_value: 0.8,
-        }
+    #[test]
+    fn test_create_map_node() {
+        let config = MapConfig {
+            node_id: "rover-nasa-01".into(),
+            agency: AgencyId::Nasa,
+            capabilities: vec!["mobility".into(), "sampling".into()],
+            priority: 10,
+            platform: PlatformType::WheeledRover,
+        };
+
+        let node = MapNode::new(config);
+        assert_eq!(node.state.blocking_read().id.0, "rover-nasa-01");
+        assert_eq!(node.state.blocking_read().priority, 10);
     }
 
-    #[test]
-    fn test_scheduler_basic_flow() {
-        let mut scheduler = AutonomousScheduler::new();
+    #[tokio::test]
+    async fn test_register_and_find_peer() {
+        let config = MapConfig {
+            node_id: "rover-nasa-01".into(),
+            agency: AgencyId::Nasa,
+            capabilities: vec!["mobility".into()],
+            priority: 10,
+            platform: PlatformType::WheeledRover,
+        };
 
-        let t1 = sample_task("task-1", TaskCategory::Science, 80);
-        let t2 = sample_task("task-2", TaskCategory::Navigation, 60);
-        let t3 = sample_task("task-3", TaskCategory::Emergency, 100);
+        let node = MapNode::new(config);
 
-        scheduler.add_task(t1).unwrap();
-        scheduler.add_task(t2).unwrap();
-        scheduler.add_task(t3).unwrap();
+        let peer = PeerInfo {
+            id: NodeId("habitat-esa-01".into()),
+            agency: AgencyId::Esa,
+            platform: PlatformType::Habitat,
+            capabilities: vec!["power".into(), "comms".into()],
+            status: NodeStatus::Active,
+            last_seen: chrono::Utc::now(),
+            priority: 5,
+        };
 
-        let schedule = scheduler.prioritize_all();
-        assert_eq!(schedule.len(), 3);
-        assert_eq!(schedule[0], TaskId("task-3".into())); // Emergency en premier
+        node.register_peer(peer).await.unwrap();
+
+        let found = node.find_by_capability("power").await;
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id.0, "habitat-esa-01");
     }
 
-    #[test]
-    fn test_scheduler_statistics() {
-        let mut scheduler = AutonomousScheduler::new();
+    #[tokio::test]
+    async fn test_network_summary() {
+        let config = MapConfig {
+            node_id: "rover-nasa-01".into(),
+            agency: AgencyId::Nasa,
+            capabilities: vec!["mobility".into()],
+            priority: 10,
+            platform: PlatformType::WheeledRover,
+        };
 
-        for i in 0..5 {
-            let task = MarsTask {
-                status: if i < 3 { TaskStatus::Completed } else { TaskStatus::Queued },
-                priority: 50 + i,
-                ..sample_task(&format!("task-{}", i), TaskCategory::Science, 50 + i)
-            };
-            scheduler.add_task(task).unwrap();
-        }
+        let node = MapNode::new(config);
 
-        let stats = scheduler.statistics();
-        assert_eq!(stats.total_tasks, 5);
-        assert_eq!(stats.completed, 3);
-        assert_eq!(stats.queued, 2);
+        let peer1 = PeerInfo {
+            id: NodeId("habitat-esa-01".into()),
+            agency: AgencyId::Esa,
+            platform: PlatformType::Habitat,
+            capabilities: vec!["power".into()],
+            status: NodeStatus::Active,
+            last_seen: chrono::Utc::now(),
+            priority: 5,
+        };
+
+        let peer2 = PeerInfo {
+            id: NodeId("orbiter-spacex-01".into()),
+            agency: AgencyId::Spacex,
+            platform: PlatformType::Orbiter,
+            capabilities: vec!["relay".into()],
+            status: NodeStatus::Active,
+            last_seen: chrono::Utc::now(),
+            priority: 8,
+        };
+
+        node.register_peer(peer1).await.unwrap();
+        node.register_peer(peer2).await.unwrap();
+
+        let summary = node.network_summary().await;
+        assert_eq!(summary.total_peers, 2);
+        assert_eq!(summary.active_peers, 2);
+        assert!(summary.agencies_present.contains(&AgencyId::Esa));
+        assert!(summary.agencies_present.contains(&AgencyId::Spacex));
     }
 }
