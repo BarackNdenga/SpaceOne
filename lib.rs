@@ -1,298 +1,269 @@
-//! # DTN++ — Delay-Tolerant Networking Avancé
+//! # Autonomous Scheduler
 //!
-//! Extension du standard Bundle Protocol (RFC 9171) pour les communications
-//! interplanétaires avec latence élevée (6-22 minutes Terre-Mars).
+//! Planificateur autonome embarqué pour la coordination des tâches martiennes.
+//! Utilise un modèle ONNX (radiation-tolerant via TMR) pour la priorisation
+//! et intègre un planificateur de contingence pour les situations d'urgence.
 //!
-//! ## Caractéristiques
+//! ## Architecture
 //!
-//! - **Priority Bundles** : Classification en 8 niveaux de priorité
-//! - **AI Compression** : Compression adaptative par réseau neuronal embarqué
-//! - **Store-and-Forward** : Buffering intelligent pendant les blackouts
-//! - **Contact Plan** : Planification des fenêtres de communication
+//! Le scheduler fonctionne en 3 phases :
+//! 1. **Priorisation** — Classe les tâches par urgence et impact scientifique
+//! 2. **Résolution de conflits** — Détecte et résout les chevauchements
+//! 3. **Plan de contingence** — Génère des plans alternatifs en cas d'anomalie
 
-pub mod priority_bundle;
-pub mod ai_compression;
-pub mod store_forward;
+pub mod task_prioritizer;
+pub mod conflict_resolver;
+pub mod contingency_planner;
 
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::collections::{BinaryHeap, HashMap};
+use std::cmp::Ordering;
+use chrono::{DateTime, Utc};
 use thiserror::Error;
 use tracing::{info, warn, error};
-use chrono::{DateTime, Utc};
 
-// ─── Types de Base ───
+// ─── Types de Tâches ───
 
-/// Identifiant unique d'un bundle DTN
+/// Catégorie scientifique d'une tâche
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TaskCategory {
+    Science,        // Observation, échantillonnage, analyse
+    Navigation,     // Déplacement, cartographie
+    Maintenance,    // Calibration, nettoyage, diagnostic
+    Communication,  // Transmission, relay, uplink
+    LifeSupport,    // Énergie, air, eau, thermique
+    Emergency,      // Safe mode, escape, shutdown
+}
+
+/// Statut d'une tâche
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TaskStatus {
+    Queued,
+    Scheduled,
+    InProgress,
+    Completed,
+    Failed,
+    Cancelled,
+    Contingency, // Répliquée par le plan de contingence
+}
+
+/// Identifiant unique d'une tâche
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct BundleId(pub String);
+pub struct TaskId(pub String);
 
-impl std::fmt::Display for BundleId {
+impl std::fmt::Display for TaskId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "bundle:{}", self.0)
+        write!(f, "{}", self.0)
     }
 }
 
-/// Destination d'un bundle
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum BundleDestination {
-    /// Noeud spécifique sur Mars
-    MarsNode(String),
-    /// Station au sol sur Terre
-    EarthStation(String),
-    /// Diffusion à tous les noeuds du mesh
-    Broadcast,
-    /// Noeud relais (orbiteur)
-    Relay(String),
-}
-
-/// Statut de livraison d'un bundle
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum DeliveryStatus {
-    Queued,
-    Transmitting,
-    InTransit,
-    Delivered,
-    Failed { reason: String },
-    Expired,
-}
-
-/// Fenêtre de contact (période de communication possible)
+/// Une tâche planifiable sur Mars
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ContactPlan {
-    pub start: DateTime<Utc>,
-    pub end: DateTime<Utc>,
-    pub partner: BundleDestination,
-    pub bandwidth_kbps: f64,
-    pub latency_minutes: f64,
-    pub reliability: f64, // 0.0-1.0
+pub struct MarsTask {
+    pub id: TaskId,
+    pub name: String,
+    pub category: TaskCategory,
+    pub priority: u16,       // 0-100, calculé par l'IA
+    pub deadline: Option<DateTime<Utc>>,
+    pub estimated_duration_secs: u32,
+    pub dependencies: Vec<TaskId>,
+    pub required_resources: Vec<ResourceRequirement>,
+    pub executing_node: Option<String>,
+    pub status: TaskStatus,
+    pub created_at: DateTime<Utc>,
+    pub scientific_value: f64, // Score scientifique 0.0-1.0
+}
+
+/// Exigence de ressource pour une tâche
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourceRequirement {
+    pub resource_type: String,
+    pub amount: f64,
+    pub unit: String,
+    pub critical: bool, // Si false, la tâche peut être réduite
 }
 
 // ─── Erreurs ───
 
 #[derive(Error, Debug)]
-pub enum DtnError {
-    #[error("Buffer plein: capacity={capacity}")]
-    BufferFull { capacity: usize },
+pub enum SchedulerError {
+    #[error("Tâche introuvable: {0}")]
+    TaskNotFound(TaskId),
 
-    #[error("Aucune route vers: {0}")]
-    NoRoute(BundleDestination),
+    #[error("Cycle de dépendances détecté dans: {0}")]
+    DependencyCycle(String),
 
-    #[error("Bundle expiré: {0}")]
-    BundleExpired(BundleId),
+    #[error("Ressources insuffisantes pour: {0}")]
+    InsufficientResources(String),
 
-    #[error("Contact window fermée pour: {0}")]
-    ContactWindowClosed(BundleDestination),
+    #[error("Deadline dépassée: {0}")]
+    DeadlineExceeded(TaskId),
 
-    #[error("Compression échouée: {0}")]
-    CompressionFailed(String),
+    #[error("Conflit non résolu: {0}")]
+    UnresolvedConflict(String),
 }
 
-pub type DtnResult<T> = Result<T, DtnError>;
+pub type SchedulerResult<T> = Result<T, SchedulerError>;
 
-// ─── DTN Node ───
+// ─── Scheduler Principal ───
 
-/// Noeud DTN principal
-pub struct DtnNode {
-    /// Identifiant de ce noeud
-    pub local_id: String,
-    /// Buffer de stockage (store-and-forward)
-    pub buffer: Arc<RwLock<VecDeque<priority_bundle::PriorityBundle>>>,
-    /// Capacité maximale du buffer (bundles)
-    pub buffer_capacity: usize,
-    /// Plan de contacts actifs
-    pub contact_plans: Arc<RwLock<Vec<ContactPlan>>>,
-    /// Statistiques de transmission
-    pub stats: Arc<RwLock<DtnStats>>,
+/// Scheduler autonome embarqué
+pub struct AutonomousScheduler {
+    tasks: HashMap<TaskId, MarsTask>,
+    schedule: Vec<TaskId>,
+    prioritizer: task_prioritizer::TaskPrioritizer,
+    resolver: conflict_resolver::ConflictResolver,
+    contingency: contingency_planner::ContingencyPlanner,
 }
 
-/// Statistiques DTN
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct DtnStats {
-    pub bundles_sent: u64,
-    pub bundles_received: u64,
-    pub bundles_delivered: u64,
-    pub bundles_failed: u64,
-    pub bytes_transmitted: u64,
-    pub bytes_buffered: u64,
-    pub current_buffer_count: usize,
-    pub average_latency_minutes: f64,
-    pub contact_windows_used: u64,
-}
-
-impl DtnNode {
-    /// Crée un nouveau noeud DTN
-    pub fn new(local_id: String, buffer_capacity: usize) -> Self {
-        info!("DTN++ node initialized: {} (buffer={})", local_id, buffer_capacity);
+impl AutonomousScheduler {
+    /// Crée un nouveau scheduler autonome
+    pub fn new() -> Self {
         Self {
-            local_id,
-            buffer: Arc::new(RwLock::new(VecDeque::with_capacity(buffer_capacity))),
-            buffer_capacity,
-            contact_plans: Arc::new(RwLock::new(Vec::new())),
-            stats: Arc::new(RwLock::new(DtnStats::default())),
+            tasks: HashMap::new(),
+            schedule: Vec::new(),
+            prioritizer: task_prioritizer::TaskPrioritizer::new(),
+            resolver: conflict_resolver::ConflictResolver::new(),
+            contingency: contingency_planner::ContingencyPlanner::new(),
         }
     }
 
-    /// Enqueue un bundle pour transmission
-    pub async fn enqueue(&self, bundle: priority_bundle::PriorityBundle) -> DtnResult<()> {
-        let mut buffer = self.buffer.write().await;
-        if buffer.len() >= self.buffer_capacity {
-            return Err(DtnError::BufferFull { capacity: self.buffer_capacity });
-        }
-        buffer.push_back(bundle);
-        info!("Bundle enqueued, buffer size: {}", buffer.len());
-        Ok(())
+    /// Ajoute une nouvelle tâche au scheduler
+    pub fn add_task(&mut self, task: MarsTask) -> SchedulerResult<&TaskId> {
+        let id = task.id.clone();
+        self.tasks.insert(id.clone(), task);
+        info!("Task added: {} (category={:?}, priority={})", 
+              id, self.tasks[&id].category, self.tasks[&id].priority);
+        Ok(&id)
     }
 
-    /// Déqueue le prochain bundle par priorité
-    pub async fn dequeue_highest_priority(&self) -> Option<priority_bundle::PriorityBundle> {
-        let mut buffer = self.buffer.write().await;
-        if buffer.is_empty() {
-            return None;
-        }
-
-        // Trouver l'index du bundle de plus haute priorité
-        let mut best_idx = 0;
-        let mut best_priority = buffer[0].priority;
-        for (i, bundle) in buffer.iter().enumerate() {
-            if bundle.priority > best_priority {
-                best_priority = bundle.priority;
-                best_idx = i;
-            }
-        }
-
-        buffer.remove(best_idx)
+    /// Supprime une tâche du scheduler
+    pub fn remove_task(&mut self, task_id: &TaskId) -> SchedulerResult<MarsTask> {
+        self.tasks.remove(task_id)
+            .ok_or(SchedulerError::TaskNotFound(task_id.clone()))
     }
 
-    /// Enregistre un plan de contact
-    pub async fn add_contact_plan(&self, plan: ContactPlan) {
-        let mut plans = self.contact_plans.write().await;
-        plans.push(plan);
-        info!("Contact plan added, total: {}", plans.len());
+    /// Exécute la priorisation complète de toutes les tâches
+    pub fn prioritize_all(&mut self) -> Vec<TaskId> {
+        let tasks: Vec<&MarsTask> = self.tasks.values().collect();
+        let prioritized = self.prioritizer.prioritize(&tasks);
+
+        self.schedule = prioritized.iter().map(|t| t.id.clone()).collect();
+        info!("Prioritized {} tasks", self.schedule.len());
+        self.schedule.clone()
     }
 
-    /// Vérifie si une fenêtre de contact est disponible
-    pub async fn has_active_contact(&self, partner: &BundleDestination) -> Option<&ContactPlan> {
-        let plans = self.contact_plans.read().await;
-        let now = Utc::now();
-        plans
+    /// Résout les conflits dans le planning
+    pub fn resolve_conflicts(&mut self) -> Vec<conflict_resolver::ConflictResolution> {
+        let tasks: Vec<&MarsTask> = self.tasks.values()
+            .filter(|t| t.status == TaskStatus::Scheduled || t.status == TaskStatus::InProgress)
+            .collect();
+
+        self.resolver.resolve(&tasks)
+    }
+
+    /// Génère un plan de contingence pour une tâche défaillante
+    pub fn generate_contingency(&self, failed_task: &TaskId) -> Option<contingency_planner::ContingencyPlan> {
+        let task = self.tasks.get(failed_task)?;
+        self.contingency.plan(task, &self.tasks)
+    }
+
+    /// Produit le planning ordonné complet
+    pub fn full_schedule(&self) -> Vec<&MarsTask> {
+        self.schedule
             .iter()
-            .find(|p| &p.partner == partner && p.start <= now && p.end >= now)
+            .filter_map(|id| self.tasks.get(id))
+            .collect()
     }
 
-    /// Statistiques courantes
-    pub async fn get_stats(&self) -> DtnStats {
-        let stats = self.stats.read().await;
-        let buffer = self.buffer.read().await;
-        let mut s = stats.clone();
-        s.current_buffer_count = buffer.len();
-        s.bytes_buffered = buffer.iter().map(|b| b.payload_size).sum();
-        s
-    }
+    /// Statistiques du scheduler
+    pub fn statistics(&self) -> SchedulerStats {
+        let by_status: HashMap<TaskStatus, usize> = self.tasks.values()
+            .fold(HashMap::new(), |mut acc, t| {
+                *acc.entry(t.status.clone()).or_insert(0) += 1;
+                acc
+            });
 
-    /// Nettoie les bundles expirés
-    pub async fn cleanup_expired(&self) -> usize {
-        let mut buffer = self.buffer.write().await;
-        let now = Utc::now();
-        let initial = buffer.len();
-        buffer.retain(|b| b.expires_at > now);
-        let removed = initial - buffer.len();
-        if removed > 0 {
-            warn!("Cleaned up {} expired bundles", removed);
+        SchedulerStats {
+            total_tasks: self.tasks.len(),
+            completed: by_status.get(&TaskStatus::Completed).copied().unwrap_or(0),
+            in_progress: by_status.get(&TaskStatus::InProgress).copied().unwrap_or(0),
+            failed: by_status.get(&TaskStatus::Failed).copied().unwrap_or(0),
+            queued: by_status.get(&TaskStatus::Queued).copied().unwrap_or(0),
+            average_priority: if self.tasks.is_empty() {
+                0.0
+            } else {
+                self.tasks.values().map(|t| t.priority as f64).sum::<f64>() / self.tasks.len() as f64
+            },
         }
-        removed
     }
+}
 
-    /// Taille actuelle du buffer
-    pub async fn buffer_size(&self) -> usize {
-        self.buffer.read().await.len()
-    }
-
-    /// Capacité restante
-    pub async fn remaining_capacity(&self) -> usize {
-        let buffer = self.buffer.read().await;
-        self.buffer_capacity.saturating_sub(buffer.len())
-    }
+/// Statistiques du scheduler
+#[derive(Debug, Clone)]
+pub struct SchedulerStats {
+    pub total_tasks: usize,
+    pub completed: usize,
+    pub in_progress: usize,
+    pub failed: usize,
+    pub queued: usize,
+    pub average_priority: f64,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use priority_bundle::{PriorityBundle, BundlePriority};
 
-    #[tokio::test]
-    async fn test_enqueue_and_dequeue() {
-        let node = DtnNode::new("rover-01".into(), 100);
-
-        let bundle1 = PriorityBundle {
-            id: BundleId("b1".into()),
-            priority: BundlePriority::Normal,
-            source: "rover-01".into(),
-            destination: BundleDestination::Relay("orbiter-01".into()),
-            payload: vec![1, 2, 3],
-            payload_size: 3,
+    fn sample_task(id: &str, category: TaskCategory, priority: u16) -> MarsTask {
+        MarsTask {
+            id: TaskId(id.into()),
+            name: format!("Task {}", id),
+            category,
+            priority,
+            deadline: None,
+            estimated_duration_secs: 300,
+            dependencies: vec![],
+            required_resources: vec![],
+            executing_node: None,
+            status: TaskStatus::Queued,
             created_at: Utc::now(),
-            expires_at: Utc::now() + chrono::Duration::hours(24),
-            ttl: 86400,
-        };
-
-        node.enqueue(bundle1.clone()).await.unwrap();
-        assert_eq!(node.buffer_size().await, 1);
-
-        let dequeued = node.dequeue_highest_priority().await;
-        assert!(dequeued.is_some());
-        assert_eq!(dequeued.unwrap().id, BundleId("b1".into()));
+            scientific_value: 0.8,
+        }
     }
 
-    #[tokio::test]
-    async fn test_buffer_capacity() {
-        let node = DtnNode::new("test".into(), 2);
+    #[test]
+    fn test_scheduler_basic_flow() {
+        let mut scheduler = AutonomousScheduler::new();
 
-        let bundle = || PriorityBundle {
-            id: BundleId(uuid::Uuid::new_v4().to_string()),
-            priority: BundlePriority::Normal,
-            source: "test".into(),
-            destination: BundleDestination::EarthStation("deep-space-network".into()),
-            payload: vec![0],
-            payload_size: 1,
-            created_at: Utc::now(),
-            expires_at: Utc::now() + chrono::Duration::hours(1),
-            ttl: 3600,
-        };
+        let t1 = sample_task("task-1", TaskCategory::Science, 80);
+        let t2 = sample_task("task-2", TaskCategory::Navigation, 60);
+        let t3 = sample_task("task-3", TaskCategory::Emergency, 100);
 
-        node.enqueue(bundle()).await.unwrap();
-        node.enqueue(bundle()).await.unwrap();
+        scheduler.add_task(t1).unwrap();
+        scheduler.add_task(t2).unwrap();
+        scheduler.add_task(t3).unwrap();
 
-        let result = node.enqueue(bundle()).await;
-        assert!(result.is_err()); // Buffer plein
+        let schedule = scheduler.prioritize_all();
+        assert_eq!(schedule.len(), 3);
+        assert_eq!(schedule[0], TaskId("task-3".into())); // Emergency en premier
     }
 
-    #[tokio::test]
-    async fn test_contact_plan() {
-        let node = DtnNode::new("orbiter-01".into(), 100);
+    #[test]
+    fn test_scheduler_statistics() {
+        let mut scheduler = AutonomousScheduler::new();
 
-        let plan = ContactPlan {
-            start: Utc::now() - chrono::Duration::minutes(30),
-            end: Utc::now() + chrono::Duration::hours(2),
-            partner: BundleDestination::EarthStation("dsn-madrid".into()),
-            bandwidth_kbps: 2.0,
-            latency_minutes: 11.0,
-            reliability: 0.95,
-        };
+        for i in 0..5 {
+            let task = MarsTask {
+                status: if i < 3 { TaskStatus::Completed } else { TaskStatus::Queued },
+                priority: 50 + i,
+                ..sample_task(&format!("task-{}", i), TaskCategory::Science, 50 + i)
+            };
+            scheduler.add_task(task).unwrap();
+        }
 
-        node.add_contact_plan(plan).await;
-
-        let contact = node.has_active_contact(&BundleDestination::EarthStation("dsn-madrid".into())).await;
-        assert!(contact.is_some());
-        assert!((contact.unwrap().bandwidth_kbps - 2.0).abs() < 0.01);
-    }
-
-    #[tokio::test]
-    async fn test_stats() {
-        let node = DtnNode::new("stats-test".into(), 50);
-        let stats = node.get_stats().await;
-        assert_eq!(stats.current_buffer_count, 0);
-        assert_eq!(stats.bundles_sent, 0);
+        let stats = scheduler.statistics();
+        assert_eq!(stats.total_tasks, 5);
+        assert_eq!(stats.completed, 3);
+        assert_eq!(stats.queued, 2);
     }
 }
