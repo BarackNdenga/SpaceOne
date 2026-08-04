@@ -1,0 +1,11 @@
+# Partitionnement disque REEL (pas simule) pour AsterQuanta OS.
+# 2 slots rootfs (A/B) geres par RAUC + 1 partition recovery + 1 partition
+# data persistante (config, logs, DTN queue, snapshots BTRFS).
+
+part /boot   --source bootimg-efi --sourceparams="loader=grub-efi" --label boot   --active --align 1024 --size 100M
+part rootfs_a --source rootfs --fstype=ext4 --label rootfs_a --align 1024 --size 1200M
+part rootfs_b --source rootfs --fstype=ext4 --label rootfs_b --align 1024 --size 1200M
+part recovery --source rootfs --fstype=ext4 --label recovery --align 1024 --size 400M --exclude-path etc/rauc
+part data     --fstype=btrfs  --label data  --align 1024 --size 800M --mkfs-extraopts="-L data"
+
+bootloader --ptable gpt --timeout=3 --append="rootwait console=ttyS0"
