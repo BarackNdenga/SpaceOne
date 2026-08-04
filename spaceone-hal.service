@@ -1,0 +1,28 @@
+[Unit]
+Description=SpaceOne Radiation-Tolerant HAL
+Documentation=https://docs.spaceone.space
+After=multi-user.target
+Before=spaceone-core.service
+RequiresMountsFor=/dev /sys /proc
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/spaceone-hal --watchdog-timeout 5000 --scrubbing-interval 1000
+Restart=always
+RestartSec=3
+RuntimeDirectory=spaceone
+
+# HAL needs hardware access
+CapabilityBoundingSet=CAP_SYS_RAWIO CAP_SYS_ADMIN CAP_DAC_OVERRIDE
+ProtectSystem=false
+ProtectHome=false
+PrivateDevices=false
+NoNewPrivileges=false
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=spaceone-hal
+
+[Install]
+WantedBy=multi-user.target
