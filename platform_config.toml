@@ -1,0 +1,65 @@
+# SpaceOne Platform Configuration
+# Target: AsterQuanta OS (Linux + systemd + RAUC + uD3TN)
+# This configuration is deployed by Yocto into /etc/spaceone/platform_config.toml
+
+[platform]
+name = "spaceone-mars"
+firmware_version = "1.0.0"
+asterquanta_os_version = "0.1.0"
+build_timestamp = "2026-08-02T00:00:00Z"
+platform_type = "mars_rover"  # mars_rover | mars_habitat | orbiter
+
+[health]
+watchdog_timeout_ms = 5000
+scrubbing_interval_ms = 1000
+sel_threshold_ma = 50
+max_seu_before_alert = 100
+health_check_interval_ms = 5000
+safe_mode_trigger_score = 0.3
+safe_mode_warning_score = 0.6
+
+[communication]
+dtn_enabled = true
+dtn_aap_socket = "/run/aqm/aqm-dtnd.aap.sock"
+dtn_buffer_mb = 512
+ai_compression = true
+encryption_algorithm = "AES-256-GCM"
+signature_algorithm = "Ed25519"
+dtn_retry_interval_s = 60
+dtn_max_bundle_lifetime_s = 86400
+
+[coordination]
+multi_agency_protocol = true
+autonomous_scheduling = true
+max_pending_tasks = 1000
+conflict_resolution_timeout_ms = 15000
+supervisor_socket = "/run/aqm/aqm-supervisor.sock"
+
+[agencies]
+nasa_enabled = true
+spacex_enabled = true
+esa_enabled = true
+cnsa_enabled = true
+
+[safety]
+safe_mode_auto_trigger = true
+crew_decision_support = true
+data_classification_enforcement = true
+rbac_enabled = true
+
+[rauc]
+update_channel = "stable"
+signature_verification = true
+auto_mark_good = true
+mark_good_timeout_s = 300
+rollback_on_failure = true
+
+[asterquanta]
+# Integration with AsterQuanta OS primitives
+supervisor_socket = "/run/aqm/aqm-supervisor.sock"
+dtnd_aap_socket = "/run/aqm/aqm-dtnd.aap.sock"
+safe_mode_target = "aqm-safe.target"
+recovery_target = "aqm-recovery.target"
+multi_user_target = "multi-user.target"
+rauc_statusfile = "/data/rauc.status"
+btrfs_data_mount = "/data"
