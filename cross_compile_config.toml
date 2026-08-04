@@ -1,0 +1,72 @@
+# SpaceOne Cross-Compilation Configuration
+# Configuration pour la compilation sur toutes les cibles hardware
+
+# ─── Native (x86_64) — Tests et développement ───
+[target.x86_64-unknown-linux-gnu]
+linker = "gcc"
+
+# ─── ARM64 (Raspberry Pi 4, i.MX8) — Embarqué production ───
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+ar = "aarch64-linux-gnu-ar"
+
+# Optimisations pour ARM64 embarqué
+rustflags = [
+    "-C", "link-arg=-Wl,-z,relro,-z,now",  # RELRO hardening
+    "-C", "opt-level=3",
+    "-C", "lto=fat",
+]
+
+# ─── RISC-V 64 — Processeurs open-source futurs ───
+[target.riscv64gc-unknown-linux-gnu]
+linker = "riscv64-linux-gnu-gcc"
+ar = "riscv64-linux-gnu-ar"
+
+rustflags = [
+    "-C", "link-arg=-Wl,-z,relro,-z,now",
+    "-C", "opt-level=3",
+]
+
+# ─── SPARC / LEON4 (space-grade) — Via GCC toolchain ESA ───
+[target.sparc64-unknown-linux-gnu]
+linker = "sparc64-linux-gnu-gcc"
+ar = "sparc64-linux-gnu-ar"
+
+# SPARC V8 a des optimisations spécifiques
+rustflags = [
+    "-C", "link-arg=-Wl,-z,relro,-z,now",
+    "-C", "opt-level=2",  # -O2 pour SPARC (lto peut causer des problèmes)
+]
+
+# ─── Build Profiles ───
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"  # Pas de unwind sur Mars — crash et reboot
+strip = true     # Réduire la taille du binaire
+
+[profile.release-spc]
+# Profil optimisé pour space-grade (pas de panic unwind)
+inherits = "release"
+panic = "abort"
+debug = false
+
+[profile.bench]
+opt-level = 3
+
+# ─── Features par cible ───
+
+[features]
+default = ["std"]
+space-grade = []          # Fonctionnalités spécifiques space-grade
+mars-rover = []           # Fonctionnalités spécifiques rover
+mars-habitat = []         # Fonctionnalités spécifiques habitat
+orbiter = []              # Fonctionnalités spécifiques orbiteur
+
+# Space-grade nécessite le HAL space-grade
+space-grade-hal = ["space-grade"]
+
+# Radiation hardening (disponible sur toutes les cibles)
+radiation-hard = []
