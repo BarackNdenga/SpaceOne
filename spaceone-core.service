@@ -1,0 +1,37 @@
+[Unit]
+Description=SpaceOne Flight Software Core
+Documentation=https://docs.spaceone.space
+After=multi-user.target aqm-supervisor.service aqm-dtnd.service
+Requires=aqm-supervisor.service
+Wants=aqm-dtnd.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/spaceone-core --config /etc/spaceone/platform_config.toml
+Restart=always
+RestartSec=5
+RuntimeDirectory=spaceone
+StateDirectory=spaceone
+ConfigurationDirectory=spaceone
+User=operator
+Group=wheel
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/run/spaceone /var/lib/spaceone /etc/spaceone
+PrivateTmp=true
+
+# Resource limits
+LimitNOFILE=65536
+MemoryMax=2G
+CPUQuota=50%
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=spaceone-core
+
+[Install]
+WantedBy=multi-user.target
