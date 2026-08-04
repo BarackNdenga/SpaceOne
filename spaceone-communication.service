@@ -1,0 +1,27 @@
+[Unit]
+Description=SpaceOne DTN++ Communication
+Documentation=https://docs.spaceone.space
+After=aqm-dtnd.service spaceone-core.service
+Requires=aqm-dtnd.service
+PartOf=spaceone-core.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/spaceone-communication --dtn-socket /run/aqm/aqm-dtnd.aap.sock --config /etc/spaceone/platform_config.toml
+Restart=always
+RestartSec=5
+RuntimeDirectory=spaceone
+
+# Communication needs network access
+ProtectSystem=true
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=spaceone-communication
+
+[Install]
+WantedBy=multi-user.target
